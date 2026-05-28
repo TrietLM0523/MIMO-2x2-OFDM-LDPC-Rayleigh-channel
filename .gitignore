@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+.vscode/
+.streamlit/
+
+debug_sim.py
+test_*.py
