@@ -7,62 +7,40 @@ import plotly.graph_objects as go
 from core_simulation import MIMOSystem
 
 
-def ber_theory_rayleigh_qam(ebno_db, M=64):
-    """
-    BER tham chiếu gần đúng cho M-QAM trên Rayleigh SISO.
-    Chỉ dùng để tham khảo, không phải lý thuyết chính xác cho MIMO 2x2 LMMSE.
-    """
-    k = np.log2(M)
-    ebno_linear = 10 ** (ebno_db / 10)
-    gamma_s = ebno_linear * k
-
-    term = np.sqrt((1.5 * gamma_s) / (M - 1 + 1.5 * gamma_s))
-    ber = (2 * (1 - 1 / np.sqrt(M)) / k) * 0.5 * (1 - term)
-
-    return ber
-
-
 st.set_page_config(
-    page_title="2x2 MIMO-OFDM LDPC Simulator",
+    page_title="Đề 5 - 2x2 MIMO-OFDM LDPC",
     layout="wide"
 )
 
 st.markdown(
     """
     <style>
-    .main {
-        background-color: #0e1117;
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
     }
     .stMetric {
-        background-color: #1a1c24;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #333;
+        background-color: #f7f7f9;
+        padding: 14px;
+        border-radius: 12px;
+        border: 1px solid #e5e7eb;
     }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-st.title("🔬 Mô phỏng 2x2 MIMO-OFDM LDPC trên kênh Rayleigh + AWGN")
+st.title("Đề 5: Mô phỏng hệ thống 2x2 MIMO-OFDM sử dụng mã hóa LDPC")
 
 st.markdown(
     """
-    Hệ thống mô phỏng:
-
-    - **MIMO 2x2 spatial multiplexing**
-    - **OFDM**
-    - **Kênh Rayleigh block fading**
-    - **Nhiễu trắng AWGN**
-    - **LDPC 5G**
-    - **Điều chế 64-QAM**
-    - **Bộ cân bằng LMMSE**
-    - Đánh giá **BER** và **SER**
+    **Kênh truyền:** Rayleigh fading + nhiễu trắng AWGN  
+    **Điều chế:** 64-QAM  
+    **Đánh giá chất lượng:** BER/SER theo Eb/N0
     """
 )
 
 st.markdown("---")
-
 
 with st.sidebar:
     st.header("⚙️ Cấu hình hệ thống")
@@ -100,7 +78,6 @@ with st.sidebar:
         "2/3": 2 / 3,
         "3/4": 3 / 4
     }
-
     code_rate = rate_map[code_rate_str]
 
     st.markdown("---")
@@ -129,12 +106,6 @@ with st.sidebar:
         key="batch_size_slider"
     )
 
-    show_theory = st.checkbox(
-        "Hiển thị đường tham chiếu Rayleigh SISO",
-        value=True,
-        key="show_theory_checkbox"
-    )
-
     run_btn = st.button(
         "🚀 CHẠY MÔ PHỎNG",
         use_container_width=True,
@@ -160,20 +131,22 @@ if run_btn:
     st.subheader("📌 Thông tin mô phỏng")
 
     info_col1, info_col2, info_col3, info_col4 = st.columns(4)
-
     info_col1.metric("MIMO", "2x2")
     info_col2.metric("Điều chế", "64-QAM")
     info_col3.metric("LDPC Rate", code_rate_str)
     info_col4.metric("Equalizer", "LMMSE")
 
-    with st.expander("🧠 Ghi chú mô hình"):
+    with st.expander("🧠 Ghi chú mô hình và đường tham chiếu"):
         st.markdown(
             """
-            - Hệ thống dùng **2 anten phát** và **2 anten thu**.
+            - Hệ thống sử dụng **2 anten phát** và **2 anten thu**.
             - Mô hình MIMO hiện tại là **spatial multiplexing**, không phải Alamouti/STBC.
-            - Bộ thu dùng **LMMSE equalizer**.
+            - Bộ thu sử dụng **LMMSE Equalizer**.
             - Bộ thu giả sử biết hoàn hảo đáp ứng kênh, tức **perfect CSI**.
-            - Đường lý thuyết Rayleigh nếu bật chỉ là đường **tham chiếu SISO uncoded 64-QAM**.
+            - Đường tham chiếu chính trong đồ thị là **MIMO-OFDM không mã hóa LDPC**.
+            - Vì vậy, so sánh chính là:
+                - **LDPC coded MIMO-OFDM**
+                - **Uncoded MIMO-OFDM reference**
             """
         )
 
@@ -184,7 +157,6 @@ if run_btn:
     ser_coded = []
     ber_uncoded = []
     ser_uncoded = []
-    theory_bers = []
 
     start_time = time.time()
 
@@ -210,18 +182,14 @@ if run_btn:
             ber_uncoded.append(ber_u)
             ser_uncoded.append(ser_u)
 
-            theory_bers.append(
-                ber_theory_rayleigh_qam(float(ebno), M=64)
-            )
-
             progress_bar.progress((i + 1) / len(ebno_range))
 
             st.write(
                 f"Eb/N0 = **{ebno} dB** | "
                 f"BER coded = `{ber_c:.3e}` | "
                 f"SER coded = `{ser_c:.3e}` | "
-                f"BER uncoded = `{ber_u:.3e}` | "
-                f"SER uncoded = `{ser_u:.3e}` | "
+                f"BER uncoded reference = `{ber_u:.3e}` | "
+                f"SER uncoded reference = `{ser_u:.3e}` | "
                 f"time = `{elapsed:.2f}s`"
             )
 
@@ -237,11 +205,10 @@ if run_btn:
     st.subheader("📈 Kết quả tổng quan")
 
     m1, m2, m3, m4 = st.columns(4)
-
-    m1.metric("BER coded thấp nhất", f"{min(ber_coded):.2e}")
-    m2.metric("SER coded thấp nhất", f"{min(ser_coded):.2e}")
-    m3.metric("BER uncoded thấp nhất", f"{min(ber_uncoded):.2e}")
-    m4.metric("SER uncoded thấp nhất", f"{min(ser_uncoded):.2e}")
+    m1.metric("BER LDPC thấp nhất", f"{min(ber_coded):.2e}")
+    m2.metric("SER LDPC thấp nhất", f"{min(ser_coded):.2e}")
+    m3.metric("BER reference thấp nhất", f"{min(ber_uncoded):.2e}")
+    m4.metric("SER reference thấp nhất", f"{min(ser_uncoded):.2e}")
 
     fig_ber = go.Figure()
 
@@ -251,7 +218,7 @@ if run_btn:
             y=ber_coded,
             mode="lines+markers",
             name=f"BER LDPC coded, R={code_rate_str}",
-            line=dict(color="#00ffcc", width=4),
+            line=dict(width=4),
             marker=dict(size=9, symbol="diamond")
         )
     )
@@ -261,36 +228,18 @@ if run_btn:
             x=ebno_range,
             y=ber_uncoded,
             mode="lines+markers",
-            name="BER uncoded simulation",
-            line=dict(color="#ffcc00", width=3),
+            name="BER MIMO-OFDM uncoded reference",
+            line=dict(width=3, dash="dash"),
             marker=dict(size=9, symbol="x")
         )
     )
 
-    if show_theory:
-        fig_ber.add_trace(
-            go.Scatter(
-                x=ebno_range,
-                y=theory_bers,
-                mode="lines",
-                name="Tham chiếu Rayleigh SISO 64-QAM",
-                line=dict(color="#ff4b4b", width=2, dash="dash")
-            )
-        )
-
     fig_ber.update_layout(
-        title="BER vs Eb/N0",
+        title="BER vs Eb/N0 - 2x2 MIMO-OFDM Rayleigh + AWGN, 64-QAM",
         xaxis_title="Eb/N0 (dB)",
         yaxis_title="Bit Error Rate (BER)",
         yaxis_type="log",
-        template="plotly_dark",
-        yaxis=dict(
-            exponentformat="e",
-            gridcolor="#333"
-        ),
-        xaxis=dict(
-            gridcolor="#333"
-        ),
+        template="plotly_white",
         hovermode="x unified",
         height=600
     )
@@ -302,8 +251,8 @@ if run_btn:
             x=ebno_range,
             y=ser_coded,
             mode="lines+markers",
-            name=f"SER coded, R={code_rate_str}",
-            line=dict(color="#00ffcc", width=4),
+            name=f"SER LDPC coded, R={code_rate_str}",
+            line=dict(width=4),
             marker=dict(size=9, symbol="diamond")
         )
     )
@@ -313,31 +262,24 @@ if run_btn:
             x=ebno_range,
             y=ser_uncoded,
             mode="lines+markers",
-            name="SER uncoded simulation",
-            line=dict(color="#ffcc00", width=3),
+            name="SER MIMO-OFDM uncoded reference",
+            line=dict(width=3, dash="dash"),
             marker=dict(size=9, symbol="x")
         )
     )
 
     fig_ser.update_layout(
-        title="SER vs Eb/N0",
+        title="SER vs Eb/N0 - 2x2 MIMO-OFDM Rayleigh + AWGN, 64-QAM",
         xaxis_title="Eb/N0 (dB)",
         yaxis_title="Symbol Error Rate (SER)",
         yaxis_type="log",
-        template="plotly_dark",
-        yaxis=dict(
-            exponentformat="e",
-            gridcolor="#333"
-        ),
-        xaxis=dict(
-            gridcolor="#333"
-        ),
+        template="plotly_white",
         hovermode="x unified",
         height=600
     )
 
-    tab1, tab2, tab3 = st.tabs(
-        ["📉 BER", "📊 SER", "📋 Bảng số liệu"]
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["📉 BER", "📊 SER", "📋 Bảng số liệu", "📝 Mô tả báo cáo"]
     )
 
     with tab1:
@@ -352,9 +294,8 @@ if run_btn:
                 "Eb/N0 (dB)": ebno_range,
                 "BER LDPC Coded": ber_coded,
                 "SER LDPC Coded": ser_coded,
-                "BER Uncoded": ber_uncoded,
-                "SER Uncoded": ser_uncoded,
-                "BER Theory Rayleigh SISO": theory_bers
+                "BER MIMO-OFDM Uncoded Reference": ber_uncoded,
+                "SER MIMO-OFDM Uncoded Reference": ser_uncoded,
             }
         )
 
@@ -363,14 +304,27 @@ if run_btn:
                 {
                     "BER LDPC Coded": "{:.3e}",
                     "SER LDPC Coded": "{:.3e}",
-                    "BER Uncoded": "{:.3e}",
-                    "SER Uncoded": "{:.3e}",
-                    "BER Theory Rayleigh SISO": "{:.3e}"
+                    "BER MIMO-OFDM Uncoded Reference": "{:.3e}",
+                    "SER MIMO-OFDM Uncoded Reference": "{:.3e}",
                 }
             ),
             use_container_width=True
         )
 
+    with tab4:
+        st.markdown(
+            f"""
+            **Đề 5: Mô phỏng hệ thống 2x2 MIMO-OFDM sử dụng mã hóa LDPC trên kênh truyền Rayleigh nhiễu trắng, điều chế 64-QAM. Đánh giá chất lượng BER/SER.**
+
+            Chương trình mô phỏng hệ thống **2x2 MIMO-OFDM** trên kênh truyền **Rayleigh fading** có cộng **nhiễu trắng AWGN**.
+            Dữ liệu nhị phân được mã hóa bằng **LDPC 5G** với code rate **{code_rate_str}**, sau đó được điều chế bằng **64-QAM**.
+            Các symbol điều chế được ánh xạ lên resource grid OFDM và truyền qua kênh Rayleigh 2x2.
+            Tại phía thu, hệ thống sử dụng bộ cân bằng **LMMSE** với giả thiết biết hoàn hảo đáp ứng kênh.
+            Hiệu năng hệ thống được đánh giá thông qua **BER** và **SER** theo các mức **Eb/N0** khác nhau.
+
+            Đường tham chiếu trong mô phỏng là nhánh **MIMO-OFDM không mã hóa LDPC**, sử dụng cùng cấu hình anten, kênh truyền, điều chế và bộ cân bằng.
+            """
+        )
 
 else:
     st.info("Nhấn **CHẠY MÔ PHỎNG** ở sidebar để bắt đầu Monte Carlo.")
