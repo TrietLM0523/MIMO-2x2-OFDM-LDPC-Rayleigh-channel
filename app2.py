@@ -4,29 +4,42 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from core_simulation import MIMOSystem
 from core_simulation2 import AlamoutiSystem
 
 
 st.set_page_config(
-    page_title="So sánh Spatial Multiplexing và Alamouti",
+    page_title="Alamouti/STBC 2x2 MIMO-OFDM LDPC",
     layout="wide"
 )
 
-st.title("So sánh 2x2 MIMO-OFDM: Spatial Multiplexing vs Alamouti/STBC")
+st.title("Alamouti/STBC 2x2 MIMO-OFDM với LDPC, 64-QAM, Rayleigh + AWGN")
 
 st.markdown(
     """
-    **Mục tiêu:** so sánh hiệu năng BER/SER giữa hai hướng triển khai MIMO 2x2:
-
-    - **Spatial Multiplexing + LMMSE:** truyền 2 stream song song, cần equalizer để tách stream.
-    - **Alamouti/STBC:** truyền theo phân tập không gian, ưu tiên độ tin cậy hơn throughput.
-
-    Cả hai đều dùng **LDPC**, **64-QAM**, **Rayleigh fading + AWGN**.
+    **Mô hình:** 2x2 Alamouti/STBC  
+    **Điều chế:** 64-QAM  
+    **Mã hóa:** LDPC 5G  
+    **Kênh:** Rayleigh fading + AWGN  
+    **Đánh giá:** BER/SER theo Eb/N0
     """
 )
 
 st.markdown("---")
+
+
+def metric_value(m):
+    return m["value"]
+
+
+def metric_text(m):
+    if m["upper_bound"]:
+        return f"≤ {m['value']:.3e}  (0 lỗi / {m['total']:.0f})"
+    return f"{m['value']:.3e}  ({m['errors']:.0f} lỗi / {m['total']:.0f})"
+
+
+def metric_status(m):
+    return "Upper bound" if m["upper_bound"] else "Measured"
+
 
 with st.sidebar:
     st.header("⚙️ Cấu hình")
@@ -67,6 +80,13 @@ with st.sidebar:
 
     code_rate = rate_map[code_rate_str]
 
+    decoder_iter = st.select_slider(
+        "LDPC Decoder Iterations",
+        options=[10, 15, 20, 25, 30, 40, 50],
+        value=25,
+        key="decoder_iter_slider"
+    )
+
     st.markdown("---")
     st.subheader("🎲 Monte Carlo")
 
@@ -74,7 +94,7 @@ with st.sidebar:
         "Số lỗi tối thiểu",
         min_value=100,
         max_value=5000,
-        value=1000,
+        value=500,
         step=100,
         key="min_errors_slider"
     )
@@ -82,7 +102,7 @@ with st.sidebar:
     max_bits = st.select_slider(
         "Giới hạn bit tối đa",
         options=[1e5, 5e5, 1e6, 5e6, 1e7, 2e7],
-        value=1e7,
+        value=5e6,
         key="max_bits_slider"
     )
 
@@ -94,9 +114,9 @@ with st.sidebar:
     )
 
     run_btn = st.button(
-        "🚀 CHẠY SO SÁNH",
+        "🚀 CHẠY ALAMOUTI",
         use_container_width=True,
-        key="run_compare_button"
+        key="run_alamouti_button"
     )
 
 
@@ -105,66 +125,56 @@ if run_btn:
         st.error("Eb/N0 Max phải lớn hơn hoặc bằng Eb/N0 Min.")
         st.stop()
 
-    ebno_range = np.arange(
-        ebno_min,
-        ebno_max + 1,
-        ebno_step
+    if ebno_step <= 0:
+        st.error("Bước Eb/N0 phải lớn hơn 0.")
+        st.stop()
+
+    ebno_range = np.arange(ebno_min, ebno_max + 1, ebno_step)
+
+    st.subheader("📌 Ghi chú mô hình")
+
+    st.warning(
+        "Bản này là bản debug Alamouti. Nếu BER LDPC sau decoder không có lỗi, "
+        "app sẽ ghi rõ là upper bound, không coi đó là BER đo chính xác."
     )
 
-    st.subheader("📌 Ghi chú quan trọng")
-
     st.info(
-        "Spatial Multiplexing và Alamouti/STBC không hoàn toàn cùng mục tiêu. "
-        "Spatial Multiplexing truyền nhiều stream để tăng throughput, còn Alamouti/STBC dùng phân tập không gian để tăng độ tin cậy. "
-        "Vì vậy so sánh này dùng để quan sát xu hướng BER/SER, không nên kết luận đơn giản rằng kỹ thuật nào luôn tốt hơn trong mọi tiêu chí."
+        "Alamouti/STBC dùng STBC combiner, không dùng LMMSEEqualizer kiểu Spatial Multiplexing. "
+        "Đường without STBC combining là baseline yếu để thấy nếu không xử lý kênh thì lỗi rất cao."
+    )
+
+    system = AlamoutiSystem(
+        code_rate=code_rate,
+        decoder_iter=int(decoder_iter)
     )
 
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    ber_spatial_ldpc = []
-    ser_spatial_pre_ldpc = []
-    ber_spatial_uncoded = []
-    ser_spatial_uncoded = []
+    rows = []
 
-    ber_alamouti_ldpc = []
-    ser_alamouti_pre_ldpc = []
-    block6_alamouti_after_decoder = []
-    ber_alamouti_uncoded = []
-    ser_alamouti_uncoded = []
+    ber_ldpc_comb = []
+    ber_uncoded_comb = []
+    ber_ldpc_no_comb = []
+    ber_uncoded_no_comb = []
+
+    pre_ber_ldpc_comb = []
+    pre_ber_ldpc_no_comb = []
+
+    ser_ldpc_comb = []
+    ser_uncoded_comb = []
+    ser_ldpc_no_comb = []
+    ser_uncoded_no_comb = []
 
     start_time = time.time()
 
     try:
-        spatial_system = MIMOSystem(code_rate=code_rate)
-        alamouti_system = AlamoutiSystem(code_rate=code_rate)
-
         for i, ebno in enumerate(ebno_range):
             status_text.info(f"Đang mô phỏng Eb/N0 = {ebno} dB...")
 
             t0 = time.time()
 
-            spatial_result = spatial_system.run_monte_carlo(
-                ebno_db=float(ebno),
-                min_errors=int(min_errs),
-                max_bits=float(max_bits),
-                batch_size=int(batch_size)
-            )
-
-            # Compatible with latest core_simulation.py:
-            # return: ber_c, ser_pre_ldpc_c, ber_u, ser_u, ber_no_eq, ser_no_eq
-            ber_s_c = spatial_result[0]
-            ser_s_pre = spatial_result[1]
-            ber_s_u = spatial_result[2]
-            ser_s_u = spatial_result[3]
-
-            (
-                ber_a_c,
-                ser_a_pre,
-                block6_a_after,
-                ber_a_u,
-                ser_a_u
-            ) = alamouti_system.run_monte_carlo(
+            result = system.run_monte_carlo(
                 ebno_db=float(ebno),
                 min_errors=int(min_errs),
                 max_bits=float(max_bits),
@@ -173,25 +183,54 @@ if run_btn:
 
             elapsed = time.time() - t0
 
-            ber_spatial_ldpc.append(ber_s_c)
-            ser_spatial_pre_ldpc.append(ser_s_pre)
-            ber_spatial_uncoded.append(ber_s_u)
-            ser_spatial_uncoded.append(ser_s_u)
+            ber_ldpc_comb.append(metric_value(result["ber_ldpc_comb"]))
+            ber_uncoded_comb.append(metric_value(result["ber_uncoded_comb"]))
+            ber_ldpc_no_comb.append(metric_value(result["ber_ldpc_no_comb"]))
+            ber_uncoded_no_comb.append(metric_value(result["ber_uncoded_no_comb"]))
 
-            ber_alamouti_ldpc.append(ber_a_c)
-            ser_alamouti_pre_ldpc.append(ser_a_pre)
-            block6_alamouti_after_decoder.append(block6_a_after)
-            ber_alamouti_uncoded.append(ber_a_u)
-            ser_alamouti_uncoded.append(ser_a_u)
+            pre_ber_ldpc_comb.append(metric_value(result["pre_ber_ldpc_comb"]))
+            pre_ber_ldpc_no_comb.append(metric_value(result["pre_ber_ldpc_no_comb"]))
+
+            ser_ldpc_comb.append(metric_value(result["ser_ldpc_comb"]))
+            ser_uncoded_comb.append(metric_value(result["ser_uncoded_comb"]))
+            ser_ldpc_no_comb.append(metric_value(result["ser_ldpc_no_comb"]))
+            ser_uncoded_no_comb.append(metric_value(result["ser_uncoded_no_comb"]))
+
+            rows.append(
+                {
+                    "Eb/N0 (dB)": ebno,
+
+                    "BER LDPC + STBC Combiner": result["ber_ldpc_comb"]["value"],
+                    "BER LDPC + STBC Combiner Status": metric_status(result["ber_ldpc_comb"]),
+                    "LDPC Combiner Bit Errors": result["ber_ldpc_comb"]["errors"],
+                    "LDPC Combiner Total Bits": result["ber_ldpc_comb"]["total"],
+
+                    "Pre-decoder BER LDPC + Combiner": result["pre_ber_ldpc_comb"]["value"],
+                    "Pre-decoder LDPC Combiner Bit Errors": result["pre_ber_ldpc_comb"]["errors"],
+
+                    "BER Uncoded + STBC Combiner": result["ber_uncoded_comb"]["value"],
+                    "BER Uncoded + STBC Combiner Status": metric_status(result["ber_uncoded_comb"]),
+
+                    "BER LDPC without STBC Combining": result["ber_ldpc_no_comb"]["value"],
+                    "BER LDPC without STBC Combining Status": metric_status(result["ber_ldpc_no_comb"]),
+
+                    "BER Uncoded without STBC Combining": result["ber_uncoded_no_comb"]["value"],
+                    "BER Uncoded without STBC Combining Status": metric_status(result["ber_uncoded_no_comb"]),
+
+                    "SER LDPC before Decoder + STBC Combiner": result["ser_ldpc_comb"]["value"],
+                    "SER Uncoded + STBC Combiner": result["ser_uncoded_comb"]["value"],
+                    "SER LDPC before Decoder without STBC Combining": result["ser_ldpc_no_comb"]["value"],
+                    "SER Uncoded without STBC Combining": result["ser_uncoded_no_comb"]["value"],
+                }
+            )
 
             progress_bar.progress((i + 1) / len(ebno_range))
 
             st.write(
                 f"Eb/N0 = **{ebno} dB** | "
-                f"BER Spatial LDPC = `{ber_s_c:.3e}` | "
-                f"BER Alamouti LDPC = `{ber_a_c:.3e}` | "
-                f"BER Spatial uncoded = `{ber_s_u:.3e}` | "
-                f"BER Alamouti uncoded = `{ber_a_u:.3e}` | "
+                f"BER LDPC + Combiner = `{metric_text(result['ber_ldpc_comb'])}` | "
+                f"Pre-BER LDPC + Combiner = `{metric_text(result['pre_ber_ldpc_comb'])}` | "
+                f"BER Uncoded + Combiner = `{metric_text(result['ber_uncoded_comb'])}` | "
                 f"time = `{elapsed:.2f}s`"
             )
 
@@ -207,7 +246,7 @@ if run_btn:
     st.subheader("📈 Kết quả")
 
     # ============================================================
-    # BER comparison
+    # BER figure
     # ============================================================
 
     fig_ber = go.Figure()
@@ -215,9 +254,9 @@ if run_btn:
     fig_ber.add_trace(
         go.Scatter(
             x=ebno_range,
-            y=ber_spatial_ldpc,
+            y=ber_ldpc_comb,
             mode="lines+markers",
-            name=f"BER Spatial Multiplexing + LDPC + LMMSE, R={code_rate_str}",
+            name=f"BER LDPC + STBC combiner, R={code_rate_str}",
             line=dict(width=4),
             marker=dict(size=9, symbol="diamond")
         )
@@ -226,38 +265,38 @@ if run_btn:
     fig_ber.add_trace(
         go.Scatter(
             x=ebno_range,
-            y=ber_alamouti_ldpc,
+            y=pre_ber_ldpc_comb,
             mode="lines+markers",
-            name=f"BER Alamouti/STBC + LDPC, R={code_rate_str}",
-            line=dict(width=4, dash="dash"),
-            marker=dict(size=9, symbol="circle")
-        )
-    )
-
-    fig_ber.add_trace(
-        go.Scatter(
-            x=ebno_range,
-            y=ber_spatial_uncoded,
-            mode="lines+markers",
-            name="BER Spatial uncoded + LMMSE",
+            name=f"Pre-decoder BER LDPC + combiner, R={code_rate_str}",
             line=dict(width=3, dash="dot"),
-            marker=dict(size=8, symbol="x")
+            marker=dict(size=8, symbol="circle")
         )
     )
 
     fig_ber.add_trace(
         go.Scatter(
             x=ebno_range,
-            y=ber_alamouti_uncoded,
+            y=ber_uncoded_comb,
             mode="lines+markers",
-            name="BER Alamouti uncoded",
+            name="BER uncoded + STBC combiner",
+            line=dict(width=3, dash="dash"),
+            marker=dict(size=9, symbol="x")
+        )
+    )
+
+    fig_ber.add_trace(
+        go.Scatter(
+            x=ebno_range,
+            y=ber_uncoded_no_comb,
+            mode="lines+markers",
+            name="BER uncoded without STBC combining",
             line=dict(width=3, dash="longdash"),
-            marker=dict(size=8, symbol="square")
+            marker=dict(size=9, symbol="square")
         )
     )
 
     fig_ber.update_layout(
-        title="BER vs Eb/N0 - Spatial Multiplexing vs Alamouti/STBC",
+        title="BER vs Eb/N0 - 2x2 Alamouti/STBC, Rayleigh + AWGN, 64-QAM",
         xaxis_title="Eb/N0 (dB)",
         yaxis_title="Bit Error Rate (BER)",
         yaxis_type="log",
@@ -267,7 +306,7 @@ if run_btn:
     )
 
     # ============================================================
-    # SER comparison
+    # SER figure
     # ============================================================
 
     fig_ser = go.Figure()
@@ -275,21 +314,32 @@ if run_btn:
     fig_ser.add_trace(
         go.Scatter(
             x=ebno_range,
-            y=ser_spatial_pre_ldpc,
+            y=ser_ldpc_comb,
             mode="lines+markers",
-            name="SER Spatial before LDPC decoder",
-            line=dict(width=3),
-            marker=dict(size=8, symbol="diamond")
+            name=f"SER LDPC before decoder + STBC combiner, R={code_rate_str}",
+            line=dict(width=4),
+            marker=dict(size=9, symbol="diamond")
         )
     )
 
     fig_ser.add_trace(
         go.Scatter(
             x=ebno_range,
-            y=ser_alamouti_pre_ldpc,
+            y=ser_uncoded_comb,
             mode="lines+markers",
-            name="SER Alamouti before LDPC decoder",
+            name="SER uncoded + STBC combiner",
             line=dict(width=3, dash="dash"),
+            marker=dict(size=9, symbol="x")
+        )
+    )
+
+    fig_ser.add_trace(
+        go.Scatter(
+            x=ebno_range,
+            y=ser_ldpc_no_comb,
+            mode="lines+markers",
+            name=f"SER LDPC before decoder without STBC combining, R={code_rate_str}",
+            line=dict(width=3, dash="dot"),
             marker=dict(size=8, symbol="circle")
         )
     )
@@ -297,27 +347,16 @@ if run_btn:
     fig_ser.add_trace(
         go.Scatter(
             x=ebno_range,
-            y=ser_spatial_uncoded,
+            y=ser_uncoded_no_comb,
             mode="lines+markers",
-            name="SER Spatial uncoded + LMMSE",
-            line=dict(width=3, dash="dot"),
-            marker=dict(size=8, symbol="x")
-        )
-    )
-
-    fig_ser.add_trace(
-        go.Scatter(
-            x=ebno_range,
-            y=ser_alamouti_uncoded,
-            mode="lines+markers",
-            name="SER Alamouti uncoded",
+            name="SER uncoded without STBC combining",
             line=dict(width=3, dash="longdash"),
-            marker=dict(size=8, symbol="square")
+            marker=dict(size=9, symbol="square")
         )
     )
 
     fig_ser.update_layout(
-        title="SER vs Eb/N0 - Spatial Multiplexing vs Alamouti/STBC",
+        title="SER vs Eb/N0 - 2x2 Alamouti/STBC, Rayleigh + AWGN, 64-QAM",
         xaxis_title="Eb/N0 (dB)",
         yaxis_title="Symbol Error Rate (SER)",
         yaxis_type="log",
@@ -327,43 +366,43 @@ if run_btn:
     )
 
     tab1, tab2, tab3, tab4 = st.tabs(
-        ["📉 BER", "📊 SER", "📋 Bảng số liệu", "📝 Ghi chú báo cáo"]
+        ["📉 BER", "📊 SER", "📋 Bảng số liệu", "📝 Mô tả báo cáo"]
     )
 
     with tab1:
         st.plotly_chart(fig_ber, use_container_width=True)
 
+        st.info(
+            "Đường BER LDPC sau decoder nếu có trạng thái Upper bound nghĩa là mô phỏng chưa quan sát được lỗi nào ở mốc đó. "
+            "Hãy xem thêm đường Pre-decoder BER để biết tín hiệu trước LDPC decoder còn lỗi nhiều hay ít."
+        )
+
     with tab2:
         st.plotly_chart(fig_ser, use_container_width=True)
 
-    with tab3:
-        result_df = pd.DataFrame(
-            {
-                "Eb/N0 (dB)": ebno_range,
-                "BER Spatial LDPC + LMMSE": ber_spatial_ldpc,
-                "BER Alamouti LDPC": ber_alamouti_ldpc,
-                "BER Spatial Uncoded + LMMSE": ber_spatial_uncoded,
-                "BER Alamouti Uncoded": ber_alamouti_uncoded,
-                "SER Spatial before LDPC": ser_spatial_pre_ldpc,
-                "SER Alamouti before LDPC": ser_alamouti_pre_ldpc,
-                "SER Spatial Uncoded + LMMSE": ser_spatial_uncoded,
-                "SER Alamouti Uncoded": ser_alamouti_uncoded,
-                "6-bit Block Error Alamouti after Decoder": block6_alamouti_after_decoder,
-            }
+        st.info(
+            "SER LDPC được đo trước LDPC decoder tại tầng demapper. "
+            "Sau LDPC decoder, chỉ số chính nên dùng là BER."
         )
+
+    with tab3:
+        result_df = pd.DataFrame(rows)
 
         st.dataframe(
             result_df.style.format(
                 {
-                    "BER Spatial LDPC + LMMSE": "{:.3e}",
-                    "BER Alamouti LDPC": "{:.3e}",
-                    "BER Spatial Uncoded + LMMSE": "{:.3e}",
-                    "BER Alamouti Uncoded": "{:.3e}",
-                    "SER Spatial before LDPC": "{:.3e}",
-                    "SER Alamouti before LDPC": "{:.3e}",
-                    "SER Spatial Uncoded + LMMSE": "{:.3e}",
-                    "SER Alamouti Uncoded": "{:.3e}",
-                    "6-bit Block Error Alamouti after Decoder": "{:.3e}",
+                    "BER LDPC + STBC Combiner": "{:.3e}",
+                    "Pre-decoder BER LDPC + Combiner": "{:.3e}",
+                    "BER Uncoded + STBC Combiner": "{:.3e}",
+                    "BER LDPC without STBC Combining": "{:.3e}",
+                    "BER Uncoded without STBC Combining": "{:.3e}",
+                    "SER LDPC before Decoder + STBC Combiner": "{:.3e}",
+                    "SER Uncoded + STBC Combiner": "{:.3e}",
+                    "SER LDPC before Decoder without STBC Combining": "{:.3e}",
+                    "SER Uncoded without STBC Combining": "{:.3e}",
+                    "LDPC Combiner Bit Errors": "{:.0f}",
+                    "LDPC Combiner Total Bits": "{:.0f}",
+                    "Pre-decoder LDPC Combiner Bit Errors": "{:.0f}",
                 }
             ),
             use_container_width=True
@@ -372,43 +411,25 @@ if run_btn:
     with tab4:
         st.markdown(
             f"""
-            ## Nhận xét mô hình
+            **Mô phỏng hệ thống 2x2 MIMO-OFDM sử dụng Alamouti/STBC, LDPC, 64-QAM trên kênh Rayleigh + AWGN.**
 
-            Trong mô phỏng này, hai kỹ thuật MIMO được so sánh:
+            Hệ thống sử dụng **2 anten phát** và **2 anten thu** theo kỹ thuật **Alamouti/STBC**.
+            Khác với Spatial Multiplexing, Alamouti không truyền hai stream độc lập cùng lúc mà mã hóa một luồng dữ liệu qua hai anten phát trong hai khe thời gian.
+            Mục tiêu chính của Alamouti/STBC là khai thác **phân tập không gian** để giảm ảnh hưởng của fading.
 
-            **1. Spatial Multiplexing + LMMSE**
+            Tại phía thu, bản đúng sử dụng **Alamouti/STBC combiner** để kết hợp tín hiệu thu từ hai anten và hai khe thời gian.
+            App cũng mô phỏng thêm trường hợp **without STBC combining** để minh họa rằng nếu không xử lý kênh đúng, BER/SER sẽ cao.
 
-            Kỹ thuật này truyền nhiều luồng dữ liệu song song qua các anten phát.
-            Với cấu hình 2x2 MIMO, hệ thống có thể truyền hai spatial streams cùng lúc.
-            Do các stream bị trộn qua kênh Rayleigh, bộ thu sử dụng **LMMSE Equalizer**
-            để tách và ước lượng tín hiệu phát.
+            Trong bản này, tín hiệu phát trên hai anten được chuẩn hóa công suất bởi hệ số **1/sqrt(2)** để tránh lợi thế giả do tổng công suất phát tăng gấp đôi.
 
-            **2. Alamouti/STBC**
-
-            Kỹ thuật này sử dụng mã khối không gian-thời gian để tạo phân tập không gian.
-            Thay vì truyền hai stream độc lập, Alamouti truyền một luồng dữ liệu được mã hóa
-            qua hai anten phát trong hai khe thời gian. Mục tiêu chính là tăng độ tin cậy
-            và giảm ảnh hưởng của fading.
-
-            ## Lưu ý khi so sánh
-
-            Spatial Multiplexing và Alamouti/STBC không hoàn toàn cùng mục tiêu:
-
-            - **Spatial Multiplexing** ưu tiên throughput vì truyền nhiều stream song song.
-            - **Alamouti/STBC** ưu tiên độ tin cậy nhờ diversity gain.
-
-            Vì vậy, nếu đường BER của Alamouti thấp hơn hoặc mượt hơn, điều đó không có nghĩa là
-            Spatial Multiplexing sai. Nó chỉ phản ánh rằng Alamouti có lợi thế phân tập trong kênh
-            Rayleigh fading, còn Spatial Multiplexing cần equalizer tốt để tách các stream.
-
-            ## Chỉ số đánh giá
-
-            - **BER LDPC** được đo sau LDPC decoder.
-            - **SER before LDPC decoder** được đo ở tầng demapper trước khi mã LDPC sửa lỗi.
-            - **6-bit Block Error after Decoder** không phải SER điều chế, mà chỉ là tỷ lệ lỗi nhóm 6 bit
-              thông tin sau giải mã LDPC.
+            Các chỉ số chính:
+            - **BER LDPC + STBC combiner**: BER sau LDPC decoder.
+            - **Pre-decoder BER LDPC + combiner**: BER của coded bits trước LDPC decoder, dùng để debug chất lượng demapper/LLR.
+            - **BER uncoded + STBC combiner**: BER của nhánh không mã hóa.
+            - **SER LDPC before decoder**: SER đo ở tầng demapper trước LDPC decoder.
+            - **Upper bound**: nếu không quan sát được lỗi nào, app hiển thị giá trị dạng 1/N như một giới hạn trên, không phải BER đo chính xác.
             """
         )
 
 else:
-    st.info("Nhấn **CHẠY SO SÁNH** để bắt đầu mô phỏng.")
+    st.info("Nhấn **CHẠY ALAMOUTI** để bắt đầu mô phỏng.")

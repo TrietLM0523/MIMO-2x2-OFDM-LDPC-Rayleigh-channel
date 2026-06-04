@@ -1,4 +1,3 @@
-import numpy as np
 import tensorflow as tf
 
 from sionna.phy.fec.ldpc import LDPC5GEncoder, LDPC5GDecoder
@@ -12,69 +11,61 @@ except Exception:
 
 class AlamoutiSystem:
     """
-    2x2 MIMO Alamouti/STBC system with:
-    - 2 transmit antennas
-    - 2 receive antennas
+    2x2 Alamouti/STBC system:
+    - 2 Tx antennas
+    - 2 Rx antennas
     - 64-QAM
     - LDPC 5G
     - Rayleigh fading + AWGN
-    - BER/SER evaluation
 
-    Important:
-    This is a spatial diversity model, not spatial multiplexing.
-    It transmits one STBC-coded stream over two transmit antennas.
+    This is NOT spatial multiplexing.
+    Alamouti uses STBC combiner, not LMMSEEqualizer.
     """
 
-    def __init__(self, code_rate=0.5):
-        # ======================================================
-        # 1. System parameters
-        # ======================================================
+    def __init__(self, code_rate=0.5, decoder_iter=25):
         self.num_tx_ant = 2
         self.num_rx_ant = 2
         self.bits_per_symbol = 6  # 64-QAM
 
-        # Match the old OFDM grid size approximately:
-        # old rg: 14 OFDM symbols x 64 subcarriers = 896 data symbols
-        # Alamouti needs an even number of symbols
+        # Match old OFDM grid size approximately: 14 x 64 = 896 QAM symbols
         self.num_data_symbols = 14 * 64
-
         if self.num_data_symbols % 2 != 0:
             self.num_data_symbols -= 1
 
         self.num_pairs = self.num_data_symbols // 2
 
-        # n: coded bits
+        # LDPC codeword length
         self.n = self.num_data_symbols * self.bits_per_symbol
 
-        # k: information bits
+        # information length
         self.k = int(self.n * code_rate)
 
-        # Actual code rate after rounding
         self.code_rate = self.k / self.n
 
-        # ======================================================
-        # 2. LDPC encoder / decoder
-        # ======================================================
         self.encoder = LDPC5GEncoder(self.k, self.n)
 
         self.decoder = LDPC5GDecoder(
             self.encoder,
-            num_iter=50,
+            num_iter=decoder_iter,
             hard_out=True
         )
 
-        # ======================================================
-        # 3. 64-QAM mapper / demapper
-        # ======================================================
         self.mapper = Mapper("qam", self.bits_per_symbol)
         self.demapper = Demapper("app", "qam", self.bits_per_symbol)
 
+        # Total transmit power normalization.
+        # At each Alamouti time slot, 2 antennas transmit.
+        # Scale each antenna by 1/sqrt(2) so total average Tx power stays fixed.
+        self.alpha = tf.constant(1.0 / (2.0 ** 0.5), dtype=tf.float32)
+
     def compute_noise_variance(self, ebno_db, coderate):
         """
-        Convert Eb/N0 to noise variance.
+        Eb/N0 -> noise variance.
 
-        For this Alamouti core, we do not use Sionna ResourceGrid directly,
-        so this is the standard Eb/N0 -> No conversion.
+        Assumptions:
+        - Sionna QAM constellation is normalized.
+        - STBC rate = 1 for Alamouti.
+        - Total transmit power is normalized by alpha = 1/sqrt(2).
         """
 
         ebno_db = tf.cast(ebno_db, tf.float32)
@@ -87,17 +78,27 @@ class AlamoutiSystem:
 
         return tf.cast(no, tf.float32)
 
-    def compute_ser_from_bits(self, bits_tx, llr_rx):
+    def hard_bits_from_llr(self, llr):
         """
-        SER at demapper/modulation layer.
+        Sionna convention used here:
+        LLR > 0 -> bit 1
+        LLR <= 0 -> bit 0
+        """
 
-        64-QAM:
-            1 symbol = 6 bits
+        return tf.cast(tf.math.greater(llr, 0.0), tf.float32)
 
+    def count_bit_errors(self, bits_tx, bits_rx):
+        err = tf.reduce_sum(
+            tf.cast(tf.not_equal(bits_tx, bits_rx), tf.float32)
+        )
+        total = tf.cast(tf.size(bits_tx), tf.float32)
+        return err, total
+
+    def count_symbol_errors_from_bits(self, bits_tx, bits_rx):
+        """
+        SER by grouping every 6 bits into one 64-QAM symbol.
         A symbol is wrong if at least one of its 6 bits is wrong.
         """
-
-        bits_rx = tf.cast(tf.math.greater(llr_rx, 0.0), tf.float32)
 
         bits_tx_sym = tf.reshape(bits_tx, [-1, self.bits_per_symbol])
         bits_rx_sym = tf.reshape(bits_rx, [-1, self.bits_per_symbol])
@@ -107,151 +108,173 @@ class AlamoutiSystem:
             axis=1
         )
 
-        num_sym_err = tf.reduce_sum(tf.cast(sym_err_bool, tf.float32))
-        num_symbols = tf.cast(tf.shape(bits_tx_sym)[0], tf.float32)
+        err = tf.reduce_sum(tf.cast(sym_err_bool, tf.float32))
+        total = tf.cast(tf.shape(bits_tx_sym)[0], tf.float32)
 
-        return num_sym_err, num_symbols
+        return err, total
 
-    def compute_block6_error_after_decoder(self, bits_tx, bits_rx):
+    def alamouti_channel(self, x_symbols, no):
         """
-        Optional metric:
-        6-bit block error after LDPC decoder.
-
-        This is NOT modulation SER.
-        It is just the error rate of groups of 6 information bits
-        after LDPC decoding.
-        """
-
-        usable_len = (self.k // self.bits_per_symbol) * self.bits_per_symbol
-
-        bits_tx_cut = bits_tx[..., :usable_len]
-        bits_rx_cut = bits_rx[..., :usable_len]
-
-        bits_tx_blk = tf.reshape(bits_tx_cut, [-1, self.bits_per_symbol])
-        bits_rx_blk = tf.reshape(bits_rx_cut, [-1, self.bits_per_symbol])
-
-        blk_err_bool = tf.reduce_any(
-            tf.not_equal(bits_tx_blk, bits_rx_blk),
-            axis=1
-        )
-
-        num_blk_err = tf.reduce_sum(tf.cast(blk_err_bool, tf.float32))
-        num_blk = tf.cast(tf.shape(bits_tx_blk)[0], tf.float32)
-
-        return num_blk_err, num_blk
-
-    def alamouti_channel_and_combine(self, x_symbols, no):
-        """
-        Apply 2Tx-2Rx Alamouti STBC over Rayleigh + AWGN.
+        Alamouti 2Tx-2Rx channel.
 
         Input:
-            x_symbols shape:
-                [batch, 1, 1, num_data_symbols]
+            x_symbols: [batch, 1, 1, num_data_symbols]
 
-        Output:
-            x_hat shape:
-                [batch, 1, 1, num_data_symbols]
+        Returns:
+            x_hat_comb:
+                Alamouti/STBC combined symbols.
 
-            no_eff shape:
-                [batch, 1, 1, num_data_symbols]
+            no_eff_comb:
+                Effective noise variance after Alamouti combining.
+
+            x_hat_no_comb:
+                Weak baseline without STBC combining.
+
+            no_eff_no_comb:
+                Noise variance for weak baseline.
         """
 
-        # Flatten to [batch, num_data_symbols]
         x = tf.reshape(x_symbols, [-1, self.num_data_symbols])
         batch_size = tf.shape(x)[0]
 
-        # Pair symbols: [s1, s2]
         x_pair = tf.reshape(x, [batch_size, self.num_pairs, 2])
         s1 = x_pair[:, :, 0]
         s2 = x_pair[:, :, 1]
 
-        # Rayleigh channel for each Alamouti pair
-        # h shape: [batch, num_pairs, num_rx_ant, num_tx_ant]
+        # Rayleigh channel:
+        # h: [batch, pair, rx_ant, tx_ant]
         h_real = tf.random.normal(
             [batch_size, self.num_pairs, self.num_rx_ant, self.num_tx_ant],
             dtype=tf.float32
         )
-
         h_imag = tf.random.normal(
             [batch_size, self.num_pairs, self.num_rx_ant, self.num_tx_ant],
             dtype=tf.float32
         )
 
-        h = tf.complex(h_real, h_imag) / tf.sqrt(tf.constant(2.0, tf.complex64))
+        h = tf.complex(h_real, h_imag) / tf.cast(
+            tf.sqrt(tf.constant(2.0, dtype=tf.float32)),
+            tf.complex64
+        )
 
-        h1 = h[:, :, :, 0]  # channel from Tx1 to each Rx
-        h2 = h[:, :, :, 1]  # channel from Tx2 to each Rx
+        h1 = h[:, :, :, 0]  # Tx1 -> Rx antennas
+        h2 = h[:, :, :, 1]  # Tx2 -> Rx antennas
 
-        # Expand symbols for receive antenna dimension
-        s1_e = tf.expand_dims(s1, axis=-1)  # [batch, pair, 1]
+        alpha_c = tf.cast(self.alpha, tf.complex64)
+
+        # Apply total-power normalization
+        a1 = alpha_c * h1
+        a2 = alpha_c * h2
+
+        s1_e = tf.expand_dims(s1, axis=-1)
         s2_e = tf.expand_dims(s2, axis=-1)
 
-        # Alamouti transmission:
-        # time slot 1: Tx1 = s1,       Tx2 = s2
-        # time slot 2: Tx1 = -conj(s2), Tx2 = conj(s1)
-        y_t1_clean = h1 * s1_e + h2 * s2_e
-        y_t2_clean = -h1 * tf.math.conj(s2_e) + h2 * tf.math.conj(s1_e)
+        # Alamouti transmit matrix:
+        # time 1: Tx1 = s1,        Tx2 = s2
+        # time 2: Tx1 = -conj(s2), Tx2 = conj(s1)
+        y1_clean = a1 * s1_e + a2 * s2_e
+        y2_clean = -a1 * tf.math.conj(s2_e) + a2 * tf.math.conj(s1_e)
 
-        # AWGN
-        no_c = tf.cast(no, tf.complex64)
-        noise_std = tf.sqrt(no_c / tf.constant(2.0, tf.complex64))
+        # Complex AWGN with variance no
+        noise_std = tf.sqrt(no / 2.0)
+        noise_std_c = tf.cast(noise_std, tf.complex64)
 
-        n1 = noise_std * tf.complex(
-            tf.random.normal(tf.shape(y_t1_clean), dtype=tf.float32),
-            tf.random.normal(tf.shape(y_t1_clean), dtype=tf.float32)
+        n1 = noise_std_c * tf.complex(
+            tf.random.normal(tf.shape(y1_clean), dtype=tf.float32),
+            tf.random.normal(tf.shape(y1_clean), dtype=tf.float32)
         )
 
-        n2 = noise_std * tf.complex(
-            tf.random.normal(tf.shape(y_t2_clean), dtype=tf.float32),
-            tf.random.normal(tf.shape(y_t2_clean), dtype=tf.float32)
+        n2 = noise_std_c * tf.complex(
+            tf.random.normal(tf.shape(y2_clean), dtype=tf.float32),
+            tf.random.normal(tf.shape(y2_clean), dtype=tf.float32)
         )
 
-        y1 = y_t1_clean + n1
-        y2 = y_t2_clean + n2
+        y1 = y1_clean + n1
+        y2 = y2_clean + n2
 
-        # Alamouti combining over receive antennas
-        # s1_hat = sum_r conj(h1)*y1 + h2*conj(y2)
-        # s2_hat = sum_r conj(h2)*y1 - h1*conj(y2)
+        # ======================================================
+        # Correct Alamouti/STBC combiner
+        # ======================================================
         s1_comb = tf.reduce_sum(
-            tf.math.conj(h1) * y1 + h2 * tf.math.conj(y2),
+            tf.math.conj(a1) * y1 + a2 * tf.math.conj(y2),
             axis=2
         )
 
         s2_comb = tf.reduce_sum(
-            tf.math.conj(h2) * y1 - h1 * tf.math.conj(y2),
+            tf.math.conj(a2) * y1 - a1 * tf.math.conj(y2),
             axis=2
         )
 
         denom = tf.reduce_sum(
-            tf.abs(h1) ** 2 + tf.abs(h2) ** 2,
+            tf.abs(a1) ** 2 + tf.abs(a2) ** 2,
             axis=2
         )
 
-        denom = tf.maximum(denom, tf.constant(1e-12, dtype=tf.float32))
+        denom = tf.maximum(
+            denom,
+            tf.constant(1e-12, dtype=tf.float32)
+        )
 
         s1_hat = s1_comb / tf.cast(denom, tf.complex64)
         s2_hat = s2_comb / tf.cast(denom, tf.complex64)
 
-        # Effective noise variance after combining
+        # Effective noise after combining
         no_eff_pair = no / denom
 
-        # Interleave s1_hat, s2_hat back to original symbol order
         x_hat_pair = tf.stack([s1_hat, s2_hat], axis=-1)
-        x_hat = tf.reshape(x_hat_pair, [batch_size, self.num_data_symbols])
+        x_hat_comb = tf.reshape(
+            x_hat_pair,
+            [batch_size, self.num_data_symbols]
+        )
 
         no_eff_pair2 = tf.stack([no_eff_pair, no_eff_pair], axis=-1)
-        no_eff = tf.reshape(no_eff_pair2, [batch_size, self.num_data_symbols])
+        no_eff_comb = tf.reshape(
+            no_eff_pair2,
+            [batch_size, self.num_data_symbols]
+        )
 
-        x_hat = tf.reshape(x_hat, [batch_size, 1, 1, self.num_data_symbols])
-        no_eff = tf.reshape(no_eff, [batch_size, 1, 1, self.num_data_symbols])
+        x_hat_comb = tf.reshape(
+            x_hat_comb,
+            [batch_size, 1, 1, self.num_data_symbols]
+        )
 
-        return x_hat, no_eff
+        no_eff_comb = tf.reshape(
+            no_eff_comb,
+            [batch_size, 1, 1, self.num_data_symbols]
+        )
+
+        # ======================================================
+        # Weak baseline: without STBC combining
+        # ======================================================
+        # This is intentionally bad.
+        # It directly treats received antenna-0 signal as if it were the transmitted QAM symbol.
+        y1_rx0 = y1[:, :, 0]
+        y2_rx0 = y2[:, :, 0]
+
+        x_no_pair = tf.stack(
+            [y1_rx0, tf.math.conj(y2_rx0)],
+            axis=-1
+        )
+
+        x_hat_no_comb = tf.reshape(
+            x_no_pair,
+            [batch_size, self.num_data_symbols]
+        )
+
+        x_hat_no_comb = tf.reshape(
+            x_hat_no_comb,
+            [batch_size, 1, 1, self.num_data_symbols]
+        )
+
+        no_eff_no_comb = tf.ones_like(
+            tf.math.real(x_hat_no_comb),
+            dtype=tf.float32
+        ) * no
+
+        return x_hat_comb, no_eff_comb, x_hat_no_comb, no_eff_no_comb
 
     @tf.function
     def process_batch(self, batch_size, ebno_db):
-        # ======================================================
-        # Noise variance
-        # ======================================================
         no_coded = self.compute_noise_variance(
             ebno_db,
             coderate=self.code_rate
@@ -263,50 +286,71 @@ class AlamoutiSystem:
         )
 
         # ======================================================
-        # Branch 1: LDPC coded + Alamouti/STBC
+        # Branch 1: LDPC coded + Alamouti
         # ======================================================
-        bits = tf.random.uniform(
+        bits_info = tf.random.uniform(
             [batch_size, 1, 1, self.k],
             minval=0,
             maxval=2,
             dtype=tf.int32
         )
 
-        bits_float = tf.cast(bits, tf.float32)
+        bits_info = tf.cast(bits_info, tf.float32)
 
-        coded_bits = self.encoder(bits_float)
-
+        coded_bits = self.encoder(bits_info)
         x_coded = self.mapper(coded_bits)
 
-        x_hat_coded, no_eff_coded = self.alamouti_channel_and_combine(
-            x_coded,
-            no_coded
-        )
+        (
+            x_c_comb,
+            no_c_comb,
+            x_c_no,
+            no_c_no
+        ) = self.alamouti_channel(x_coded, no_coded)
 
-        llr_coded = self.demapper(x_hat_coded, no_eff_coded)
+        # With STBC combiner
+        llr_c_comb = self.demapper(x_c_comb, no_c_comb)
+        coded_bits_hat_comb = self.hard_bits_from_llr(llr_c_comb)
 
-        bits_est_coded = self.decoder(llr_coded)
-
-        err_coded = tf.reduce_sum(
-            tf.cast(tf.not_equal(bits_float, bits_est_coded), tf.float32)
-        )
-
-        num_bits_coded = tf.cast(tf.size(bits_float), tf.float32)
-
-        # SER at demapper, before LDPC decoder
-        sym_err_pre_ldpc, num_sym_pre_ldpc = self.compute_ser_from_bits(
+        pre_bit_err_c_comb, pre_bit_total_c_comb = self.count_bit_errors(
             coded_bits,
-            llr_coded
+            coded_bits_hat_comb
         )
 
-        # Optional: 6-bit block error after decoder
-        blk6_err_after_dec, num_blk6_after_dec = self.compute_block6_error_after_decoder(
-            bits_float,
-            bits_est_coded
+        ser_err_c_comb, ser_total_c_comb = self.count_symbol_errors_from_bits(
+            coded_bits,
+            coded_bits_hat_comb
+        )
+
+        bits_info_hat_comb = self.decoder(llr_c_comb)
+
+        post_bit_err_c_comb, post_bit_total_c_comb = self.count_bit_errors(
+            bits_info,
+            bits_info_hat_comb
+        )
+
+        # Without STBC combiner
+        llr_c_no = self.demapper(x_c_no, no_c_no)
+        coded_bits_hat_no = self.hard_bits_from_llr(llr_c_no)
+
+        pre_bit_err_c_no, pre_bit_total_c_no = self.count_bit_errors(
+            coded_bits,
+            coded_bits_hat_no
+        )
+
+        ser_err_c_no, ser_total_c_no = self.count_symbol_errors_from_bits(
+            coded_bits,
+            coded_bits_hat_no
+        )
+
+        bits_info_hat_no = self.decoder(llr_c_no)
+
+        post_bit_err_c_no, post_bit_total_c_no = self.count_bit_errors(
+            bits_info,
+            bits_info_hat_no
         )
 
         # ======================================================
-        # Branch 2: Uncoded + Alamouti/STBC
+        # Branch 2: Uncoded + Alamouti
         # ======================================================
         bits_u = tf.random.uniform(
             [batch_size, 1, 1, self.n],
@@ -315,45 +359,101 @@ class AlamoutiSystem:
             dtype=tf.int32
         )
 
-        bits_u_float = tf.cast(bits_u, tf.float32)
+        bits_u = tf.cast(bits_u, tf.float32)
 
-        x_uncoded = self.mapper(bits_u_float)
+        x_u = self.mapper(bits_u)
 
-        x_hat_uncoded, no_eff_uncoded = self.alamouti_channel_and_combine(
-            x_uncoded,
-            no_uncoded
+        (
+            x_u_comb,
+            no_u_comb,
+            x_u_no,
+            no_u_no
+        ) = self.alamouti_channel(x_u, no_uncoded)
+
+        # Uncoded with STBC combiner
+        llr_u_comb = self.demapper(x_u_comb, no_u_comb)
+        bits_u_hat_comb = self.hard_bits_from_llr(llr_u_comb)
+
+        bit_err_u_comb, bit_total_u_comb = self.count_bit_errors(
+            bits_u,
+            bits_u_hat_comb
         )
 
-        llr_uncoded = self.demapper(x_hat_uncoded, no_eff_uncoded)
-
-        bits_est_uncoded = tf.cast(
-            tf.math.greater(llr_uncoded, 0.0),
-            tf.float32
+        ser_err_u_comb, ser_total_u_comb = self.count_symbol_errors_from_bits(
+            bits_u,
+            bits_u_hat_comb
         )
 
-        err_uncoded = tf.reduce_sum(
-            tf.cast(tf.not_equal(bits_u_float, bits_est_uncoded), tf.float32)
+        # Uncoded without STBC combiner
+        llr_u_no = self.demapper(x_u_no, no_u_no)
+        bits_u_hat_no = self.hard_bits_from_llr(llr_u_no)
+
+        bit_err_u_no, bit_total_u_no = self.count_bit_errors(
+            bits_u,
+            bits_u_hat_no
         )
 
-        num_bits_uncoded = tf.cast(tf.size(bits_u_float), tf.float32)
-
-        sym_err_uncoded, num_sym_uncoded = self.compute_ser_from_bits(
-            bits_u_float,
-            llr_uncoded
+        ser_err_u_no, ser_total_u_no = self.count_symbol_errors_from_bits(
+            bits_u,
+            bits_u_hat_no
         )
 
         return (
-            err_coded,
-            num_bits_coded,
-            sym_err_pre_ldpc,
-            num_sym_pre_ldpc,
-            blk6_err_after_dec,
-            num_blk6_after_dec,
-            err_uncoded,
-            num_bits_uncoded,
-            sym_err_uncoded,
-            num_sym_uncoded
+            # LDPC + combiner
+            post_bit_err_c_comb,
+            post_bit_total_c_comb,
+            pre_bit_err_c_comb,
+            pre_bit_total_c_comb,
+            ser_err_c_comb,
+            ser_total_c_comb,
+
+            # LDPC no combiner
+            post_bit_err_c_no,
+            post_bit_total_c_no,
+            pre_bit_err_c_no,
+            pre_bit_total_c_no,
+            ser_err_c_no,
+            ser_total_c_no,
+
+            # Uncoded + combiner
+            bit_err_u_comb,
+            bit_total_u_comb,
+            ser_err_u_comb,
+            ser_total_u_comb,
+
+            # Uncoded no combiner
+            bit_err_u_no,
+            bit_total_u_no,
+            ser_err_u_no,
+            ser_total_u_no
         )
+
+    def _metric(self, errors, total):
+        errors = float(errors)
+        total = float(total)
+
+        if total <= 0:
+            return {
+                "value": float("nan"),
+                "errors": errors,
+                "total": total,
+                "upper_bound": True
+            }
+
+        if errors <= 0:
+            return {
+                "value": 1.0 / total,
+                "errors": errors,
+                "total": total,
+                "upper_bound": True
+            }
+
+        return {
+            "value": errors / total,
+            "errors": errors,
+            "total": total,
+            "upper_bound": False
+        }
 
     def run_monte_carlo(
         self,
@@ -362,90 +462,93 @@ class AlamoutiSystem:
         max_bits=5e6,
         batch_size=64
     ):
-        total_err_coded = 0.0
-        total_bits_coded = 0.0
+        acc = {
+            "post_err_c_comb": 0.0,
+            "post_total_c_comb": 0.0,
+            "pre_err_c_comb": 0.0,
+            "pre_total_c_comb": 0.0,
+            "ser_err_c_comb": 0.0,
+            "ser_total_c_comb": 0.0,
 
-        total_sym_err_pre_ldpc = 0.0
-        total_sym_pre_ldpc = 0.0
+            "post_err_c_no": 0.0,
+            "post_total_c_no": 0.0,
+            "pre_err_c_no": 0.0,
+            "pre_total_c_no": 0.0,
+            "ser_err_c_no": 0.0,
+            "ser_total_c_no": 0.0,
 
-        total_blk6_err_after_dec = 0.0
-        total_blk6_after_dec = 0.0
+            "bit_err_u_comb": 0.0,
+            "bit_total_u_comb": 0.0,
+            "ser_err_u_comb": 0.0,
+            "ser_total_u_comb": 0.0,
 
-        total_err_uncoded = 0.0
-        total_bits_uncoded = 0.0
-
-        total_sym_err_uncoded = 0.0
-        total_sym_uncoded = 0.0
+            "bit_err_u_no": 0.0,
+            "bit_total_u_no": 0.0,
+            "ser_err_u_no": 0.0,
+            "ser_total_u_no": 0.0,
+        }
 
         while (
-            (total_err_coded < min_errors or total_err_uncoded < min_errors)
-            and total_bits_coded < max_bits
-        ):
             (
-                e_c,
-                b_c,
-                se_pre,
-                ns_pre,
-                be6,
-                nb6,
-                e_u,
-                b_u,
-                se_u,
-                ns_u
-            ) = self.process_batch(
+                acc["post_err_c_comb"] < min_errors
+                or acc["bit_err_u_comb"] < min_errors
+            )
+            and acc["post_total_c_comb"] < max_bits
+        ):
+            result = self.process_batch(
                 int(batch_size),
                 tf.constant(float(ebno_db), dtype=tf.float32)
             )
 
-            total_err_coded += float(e_c.numpy())
-            total_bits_coded += float(b_c.numpy())
+            keys = list(acc.keys())
 
-            total_sym_err_pre_ldpc += float(se_pre.numpy())
-            total_sym_pre_ldpc += float(ns_pre.numpy())
+            for key, value in zip(keys, result):
+                acc[key] += float(value.numpy())
 
-            total_blk6_err_after_dec += float(be6.numpy())
-            total_blk6_after_dec += float(nb6.numpy())
+        return {
+            # Main BER
+            "ber_ldpc_comb": self._metric(
+                acc["post_err_c_comb"],
+                acc["post_total_c_comb"]
+            ),
+            "ber_ldpc_no_comb": self._metric(
+                acc["post_err_c_no"],
+                acc["post_total_c_no"]
+            ),
+            "ber_uncoded_comb": self._metric(
+                acc["bit_err_u_comb"],
+                acc["bit_total_u_comb"]
+            ),
+            "ber_uncoded_no_comb": self._metric(
+                acc["bit_err_u_no"],
+                acc["bit_total_u_no"]
+            ),
 
-            total_err_uncoded += float(e_u.numpy())
-            total_bits_uncoded += float(b_u.numpy())
+            # Debug pre-decoder coded BER
+            "pre_ber_ldpc_comb": self._metric(
+                acc["pre_err_c_comb"],
+                acc["pre_total_c_comb"]
+            ),
+            "pre_ber_ldpc_no_comb": self._metric(
+                acc["pre_err_c_no"],
+                acc["pre_total_c_no"]
+            ),
 
-            total_sym_err_uncoded += float(se_u.numpy())
-            total_sym_uncoded += float(ns_u.numpy())
-
-        ber_coded = (
-            total_err_coded / total_bits_coded
-            if total_err_coded > 0
-            else 1.0 / total_bits_coded
-        )
-
-        ser_pre_ldpc = (
-            total_sym_err_pre_ldpc / total_sym_pre_ldpc
-            if total_sym_err_pre_ldpc > 0
-            else 1.0 / total_sym_pre_ldpc
-        )
-
-        block6_after_decoder = (
-            total_blk6_err_after_dec / total_blk6_after_dec
-            if total_blk6_err_after_dec > 0
-            else 1.0 / total_blk6_after_dec
-        )
-
-        ber_uncoded = (
-            total_err_uncoded / total_bits_uncoded
-            if total_err_uncoded > 0
-            else 1.0 / total_bits_uncoded
-        )
-
-        ser_uncoded = (
-            total_sym_err_uncoded / total_sym_uncoded
-            if total_sym_err_uncoded > 0
-            else 1.0 / total_sym_uncoded
-        )
-
-        return (
-            ber_coded,
-            ser_pre_ldpc,
-            block6_after_decoder,
-            ber_uncoded,
-            ser_uncoded
-        )
+            # SER
+            "ser_ldpc_comb": self._metric(
+                acc["ser_err_c_comb"],
+                acc["ser_total_c_comb"]
+            ),
+            "ser_ldpc_no_comb": self._metric(
+                acc["ser_err_c_no"],
+                acc["ser_total_c_no"]
+            ),
+            "ser_uncoded_comb": self._metric(
+                acc["ser_err_u_comb"],
+                acc["ser_total_u_comb"]
+            ),
+            "ser_uncoded_no_comb": self._metric(
+                acc["ser_err_u_no"],
+                acc["ser_total_u_no"]
+            ),
+        }
