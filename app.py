@@ -4,99 +4,141 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from core_simulation import MIMOSystem
+from core_simulation import AlamoutiSystem
 
 
 st.set_page_config(
-    page_title="Đề 5 - 2x2 MIMO-OFDM LDPC",
+    page_title="2x2 MIMO-OFDM LDPC",
     layout="wide"
-)
-
-st.markdown(
-    """
-    <style>
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
-    .stMetric {
-        background-color: #f7f7f9;
-        padding: 14px;
-        border-radius: 12px;
-        border: 1px solid #e5e7eb;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
 )
 
 st.title("Đề 5: Mô phỏng hệ thống 2x2 MIMO-OFDM sử dụng mã hóa LDPC")
 
 st.markdown(
     """
-    **Kênh truyền:** Rayleigh fading + nhiễu trắng AWGN  
+    **Kênh truyền:** Rayleigh fading + AWGN  
     **Điều chế:** 64-QAM  
-    **Đánh giá chất lượng:** BER/SER theo Eb/N0
+    **Kỹ thuật MIMO:** Alamouti/STBC  
+    **Đánh giá:** BER/SER theo Eb/N0
     """
 )
 
 st.markdown("---")
 
+
+def get_value(result, mode, metric):
+    return result[mode][metric]["value"]
+
+
+def get_status(result, mode, metric):
+    return "Upper bound" if result[mode][metric]["upper_bound"] else "Measured"
+
+
+def get_errors(result, mode, metric):
+    return result[mode][metric]["errors"]
+
+
+def get_total(result, mode, metric):
+    return result[mode][metric]["total"]
+
+
+def format_metric(result, mode, metric):
+    item = result[mode][metric]
+    value = item["value"]
+    errors = item["errors"]
+    total = item["total"]
+
+    if item["upper_bound"]:
+        return f"≤ {value:.3e} | 0/{total:.0f}"
+
+    return f"{value:.3e} | {errors:.0f}/{total:.0f}"
+
+
 with st.sidebar:
-    st.header("⚙️ Cấu hình hệ thống")
+    st.header("Cấu hình mô phỏng")
 
     ebno_min = st.number_input(
         "Eb/N0 Min (dB)",
-        value=0,
-        step=1,
+        value=0.0,
+        step=0.5,
+        format="%.1f",
         key="ebno_min_input"
     )
 
     ebno_max = st.number_input(
         "Eb/N0 Max (dB)",
-        value=18,
-        step=1,
+        value=10.0,
+        step=0.5,
+        format="%.1f",
         key="ebno_max_input"
     )
 
     ebno_step = st.number_input(
         "Eb/N0 Bước (dB)",
-        value=2,
-        min_value=1,
-        step=1,
+        value=0.5,
+        min_value=0.1,
+        step=0.1,
+        format="%.1f",
         key="ebno_step_input"
     )
 
     code_rate_str = st.selectbox(
         "LDPC Code Rate",
         ["1/2", "2/3", "3/4"],
+        index=1,
         key="code_rate_select"
     )
 
     rate_map = {
         "1/2": 1 / 2,
         "2/3": 2 / 3,
-        "3/4": 3 / 4
+        "3/4": 3 / 4,
     }
 
     code_rate = rate_map[code_rate_str]
 
-    st.markdown("---")
-    st.subheader("🎲 Monte Carlo")
+    decoder_iter = st.select_slider(
+        "LDPC Decoder Iterations",
+        options=[5, 10, 15, 20, 25, 30, 40, 50],
+        value=15,
+        key="decoder_iter_slider"
+    )
 
-    min_errs = st.slider(
+    num_data_symbols = st.select_slider(
+        "Packet/Data Symbols",
+        options=[128, 256, 512, 896],
+        value=512,
+        key="num_data_symbols_slider"
+    )
+
+    equalizer_choices = st.multiselect(
+        "Equalizer",
+        ["ZF", "MMSE"],
+        default=["ZF", "MMSE"],
+        key="equalizer_multiselect"
+    )
+
+    show_no_equalizer = st.checkbox(
+        "No Equalizer",
+        value=False,
+        key="show_no_equalizer_checkbox"
+    )
+
+    st.markdown("---")
+
+    min_errors = st.slider(
         "Số lỗi tối thiểu",
         min_value=100,
         max_value=5000,
-        value=1000,
+        value=500,
         step=100,
         key="min_errors_slider"
     )
 
     max_bits = st.select_slider(
         "Giới hạn bit tối đa",
-        options=[1e5, 5e5, 1e6, 5e6, 1e7, 2e7, 5e7],
-        value=1e7,
+        options=[1e5, 5e5, 1e6, 5e6, 1e7, 2e7],
+        value=5e6,
         key="max_bits_slider"
     )
 
@@ -108,7 +150,7 @@ with st.sidebar:
     )
 
     run_btn = st.button(
-        "🚀 CHẠY MÔ PHỎNG",
+        "Chạy mô phỏng",
         use_container_width=True,
         key="run_simulation_button"
     )
@@ -119,100 +161,193 @@ if run_btn:
         st.error("Eb/N0 Max phải lớn hơn hoặc bằng Eb/N0 Min.")
         st.stop()
 
-    if ebno_step <= 0:
-        st.error("Bước Eb/N0 phải lớn hơn 0.")
+    if len(equalizer_choices) == 0 and not show_no_equalizer:
+        st.error("Cần chọn ít nhất một Equalizer.")
         st.stop()
 
+    modes = []
+
+    if "ZF" in equalizer_choices:
+        modes.append("zf")
+
+    if "MMSE" in equalizer_choices:
+        modes.append("mmse")
+
+    if show_no_equalizer:
+        modes.append("none")
+
+    mode_label = {
+        "zf": "ZF",
+        "mmse": "MMSE",
+        "none": "No Equalizer",
+    }
+
     ebno_range = np.arange(
-        ebno_min,
-        ebno_max + 1,
-        ebno_step
+        float(ebno_min),
+        float(ebno_max) + float(ebno_step) / 2,
+        float(ebno_step)
     )
 
-    st.subheader("📌 Thông tin mô phỏng")
+    st.subheader("Thông số hệ thống")
 
-    info_col1, info_col2, info_col3, info_col4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
 
-    info_col1.metric("MIMO", "2x2")
-    info_col2.metric("Điều chế", "64-QAM")
-    info_col3.metric("LDPC Rate", code_rate_str)
-    info_col4.metric("Equalizer chính", "LMMSE")
+    c1.metric("MIMO", "2x2 Alamouti")
+    c2.metric("Modulation", "64-QAM")
+    c3.metric("LDPC Rate", code_rate_str)
+    c4.metric("Packet Symbols", str(num_data_symbols))
 
-    with st.expander("🧠 Ghi chú mô hình và đường tham chiếu"):
-        st.markdown(
-            """
-            - Hệ thống sử dụng **2 anten phát** và **2 anten thu**.
-            - Mô hình MIMO hiện tại là **spatial multiplexing**, không phải Alamouti/STBC.
-            - Bộ thu chính sử dụng **LMMSE Equalizer**.
-            - Bộ thu giả sử biết hoàn hảo đáp ứng kênh, tức **perfect CSI**.
-            - Noise variance được tính bằng hàm **ebnodb2no** của Sionna để phù hợp với ResourceGrid/OFDM.
-            - Đường tham chiếu chính:
-                - **LDPC coded + LMMSE**
-                - **Uncoded + LMMSE reference**
-            - Đường phụ:
-                - **Uncoded without MIMO equalization**
-            - Đường without equalization được dùng để minh họa vai trò của bộ cân bằng LMMSE trong hệ MIMO spatial multiplexing.
-            - **SER before LDPC decoder** chỉ là SER ở tầng demapper trước sửa lỗi, nên không dùng làm đường chính để kết luận lợi ích LDPC.
-            """
-        )
+    c5, c6, c7, c8 = st.columns(4)
+
+    c5.metric("Decoder Iterations", str(decoder_iter))
+    c6.metric("Eb/N0 Points", str(len(ebno_range)))
+    c7.metric("Batch Size", str(batch_size))
+    c8.metric("Max Bits", f"{float(max_bits):.0e}")
 
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    ber_coded = []
-    ser_pre_ldpc_coded = []
-    ber_uncoded = []
-    ser_uncoded = []
-    ber_no_eq = []
-    ser_no_eq = []
+    system = AlamoutiSystem(
+        code_rate=code_rate,
+        decoder_iter=int(decoder_iter),
+        num_data_symbols=int(num_data_symbols)
+    )
+
+    data = {
+        mode: {
+            "coded_ber": [],
+            "uncoded_ber": [],
+            "coded_ser": [],
+            "uncoded_ser": [],
+        }
+        for mode in modes
+    }
+
+    rows = []
 
     start_time = time.time()
 
     try:
-        system = MIMOSystem(code_rate=code_rate)
-
         for i, ebno in enumerate(ebno_range):
-            status_text.info(f"Đang mô phỏng Eb/N0 = {ebno} dB...")
+            status_text.text(f"Đang tính Eb/N0 = {ebno:.1f} dB")
 
             t0 = time.time()
 
-            (
-                ber_c,
-                ser_pre_c,
-                ber_u,
-                ser_u,
-                ber_ne,
-                ser_ne
-            ) = system.run_monte_carlo(
+            result = system.run_monte_carlo(
                 ebno_db=float(ebno),
-                min_errors=int(min_errs),
+                min_errors=int(min_errors),
                 max_bits=float(max_bits),
                 batch_size=int(batch_size)
             )
 
             elapsed = time.time() - t0
 
-            ber_coded.append(ber_c)
-            ser_pre_ldpc_coded.append(ser_pre_c)
-            ber_uncoded.append(ber_u)
-            ser_uncoded.append(ser_u)
-            ber_no_eq.append(ber_ne)
-            ser_no_eq.append(ser_ne)
+            row = {
+                "Eb/N0 (dB)": ebno,
+                "Time (s)": elapsed,
+            }
+
+            for mode in modes:
+                data[mode]["coded_ber"].append(
+                    get_value(result, mode, "coded_ber")
+                )
+                data[mode]["uncoded_ber"].append(
+                    get_value(result, mode, "uncoded_ber")
+                )
+                data[mode]["coded_ser"].append(
+                    get_value(result, mode, "coded_ser")
+                )
+                data[mode]["uncoded_ser"].append(
+                    get_value(result, mode, "uncoded_ser")
+                )
+
+                prefix = mode_label[mode]
+
+                row[f"BER LDPC + {prefix}"] = get_value(
+                    result,
+                    mode,
+                    "coded_ber"
+                )
+                row[f"BER LDPC + {prefix} Status"] = get_status(
+                    result,
+                    mode,
+                    "coded_ber"
+                )
+                row[f"BER LDPC + {prefix} Errors"] = get_errors(
+                    result,
+                    mode,
+                    "coded_ber"
+                )
+                row[f"BER LDPC + {prefix} Total"] = get_total(
+                    result,
+                    mode,
+                    "coded_ber"
+                )
+
+                row[f"BER Uncoded + {prefix}"] = get_value(
+                    result,
+                    mode,
+                    "uncoded_ber"
+                )
+                row[f"BER Uncoded + {prefix} Status"] = get_status(
+                    result,
+                    mode,
+                    "uncoded_ber"
+                )
+                row[f"BER Uncoded + {prefix} Errors"] = get_errors(
+                    result,
+                    mode,
+                    "uncoded_ber"
+                )
+                row[f"BER Uncoded + {prefix} Total"] = get_total(
+                    result,
+                    mode,
+                    "uncoded_ber"
+                )
+
+                row[f"SER LDPC + {prefix}"] = get_value(
+                    result,
+                    mode,
+                    "coded_ser"
+                )
+                row[f"SER LDPC + {prefix} Status"] = get_status(
+                    result,
+                    mode,
+                    "coded_ser"
+                )
+                row[f"SER Uncoded + {prefix}"] = get_value(
+                    result,
+                    mode,
+                    "uncoded_ser"
+                )
+                row[f"SER Uncoded + {prefix} Status"] = get_status(
+                    result,
+                    mode,
+                    "uncoded_ser"
+                )
+
+            rows.append(row)
 
             progress_bar.progress((i + 1) / len(ebno_range))
 
-            st.write(
-                f"Eb/N0 = **{ebno} dB** | "
-                f"BER coded + LMMSE = `{ber_c:.3e}` | "
-                f"BER uncoded + LMMSE = `{ber_u:.3e}` | "
-                f"BER uncoded no EQ = `{ber_ne:.3e}` | "
-                f"SER uncoded + LMMSE = `{ser_u:.3e}` | "
-                f"SER uncoded no EQ = `{ser_ne:.3e}` | "
-                f"time = `{elapsed:.2f}s`"
-            )
+            line_parts = [
+                f"Eb/N0 = {ebno:.1f} dB",
+                f"time = {elapsed:.2f}s",
+            ]
+
+            for mode in modes:
+                prefix = mode_label[mode]
+                line_parts.append(
+                    f"BER LDPC {prefix}: {format_metric(result, mode, 'coded_ber')}"
+                )
+                line_parts.append(
+                    f"BER Uncoded {prefix}: {format_metric(result, mode, 'uncoded_ber')}"
+                )
+
+            st.write(" | ".join(line_parts))
 
         total_time = time.time() - start_time
-        status_text.success(f"✅ Mô phỏng hoàn tất trong {total_time:.2f} giây.")
+        status_text.text(f"Hoàn tất trong {total_time:.2f} giây")
 
     except Exception as e:
         st.error("Có lỗi khi chạy mô phỏng.")
@@ -220,123 +355,85 @@ if run_btn:
         st.stop()
 
     st.markdown("---")
-    st.subheader("📈 Kết quả tổng quan")
-
-    m1, m2, m3, m4 = st.columns(4)
-
-    m1.metric("BER LDPC + LMMSE thấp nhất", f"{min(ber_coded):.2e}")
-    m2.metric("BER Uncoded + LMMSE thấp nhất", f"{min(ber_uncoded):.2e}")
-    m3.metric("BER No EQ thấp nhất", f"{min(ber_no_eq):.2e}")
-    m4.metric("SER Uncoded + LMMSE thấp nhất", f"{min(ser_uncoded):.2e}")
-
-    # ============================================================
-    # BER figure
-    # ============================================================
 
     fig_ber = go.Figure()
 
-    fig_ber.add_trace(
-        go.Scatter(
-            x=ebno_range,
-            y=ber_coded,
-            mode="lines+markers",
-            name=f"BER LDPC coded + LMMSE, R={code_rate_str}",
-            line=dict(width=4),
-            marker=dict(size=9, symbol="diamond")
-        )
-    )
+    for mode in modes:
+        prefix = mode_label[mode]
 
-    fig_ber.add_trace(
-        go.Scatter(
-            x=ebno_range,
-            y=ber_uncoded,
-            mode="lines+markers",
-            name="BER uncoded + LMMSE reference",
-            line=dict(width=3, dash="dash"),
-            marker=dict(size=9, symbol="x")
+        fig_ber.add_trace(
+            go.Scatter(
+                x=ebno_range,
+                y=data[mode]["coded_ber"],
+                mode="lines+markers",
+                name=f"BER LDPC + {prefix}",
+                line=dict(width=4),
+                marker=dict(size=8)
+            )
         )
-    )
 
-    fig_ber.add_trace(
-        go.Scatter(
-            x=ebno_range,
-            y=ber_no_eq,
-            mode="lines+markers",
-            name="BER uncoded without MIMO equalization",
-            line=dict(width=3, dash="dot"),
-            marker=dict(size=9, symbol="circle")
+        fig_ber.add_trace(
+            go.Scatter(
+                x=ebno_range,
+                y=data[mode]["uncoded_ber"],
+                mode="lines+markers",
+                name=f"BER Uncoded + {prefix}",
+                line=dict(width=3, dash="dash"),
+                marker=dict(size=8)
+            )
         )
-    )
 
     fig_ber.update_layout(
-        title="BER vs Eb/N0 - 2x2 MIMO-OFDM Rayleigh + AWGN, 64-QAM",
+        title="BER vs Eb/N0",
         xaxis_title="Eb/N0 (dB)",
         yaxis_title="Bit Error Rate (BER)",
         yaxis_type="log",
         template="plotly_white",
         hovermode="x unified",
-        height=600
+        height=650
     )
-
-    # ============================================================
-    # SER figure
-    # ============================================================
-
-        # ============================================================
-    # SER figure
-    # SER có 3 đường:
-    # 1. SER before LDPC decoder
-    # 2. SER uncoded + LMMSE
-    # 3. SER uncoded without equalization
-    # ============================================================
 
     fig_ser = go.Figure()
 
-    fig_ser.add_trace(
-        go.Scatter(
-            x=ebno_range,
-            y=ser_pre_ldpc_coded,
-            mode="lines+markers",
-            name=f"SER before LDPC decoder, R={code_rate_str}",
-            line=dict(width=4),
-            marker=dict(size=9, symbol="diamond")
-        )
-    )
+    for mode in modes:
+        prefix = mode_label[mode]
 
-    fig_ser.add_trace(
-        go.Scatter(
-            x=ebno_range,
-            y=ser_uncoded,
-            mode="lines+markers",
-            name="SER uncoded + LMMSE reference",
-            line=dict(width=3, dash="dash"),
-            marker=dict(size=9, symbol="x")
+        fig_ser.add_trace(
+            go.Scatter(
+                x=ebno_range,
+                y=data[mode]["coded_ser"],
+                mode="lines+markers",
+                name=f"SER LDPC + {prefix}",
+                line=dict(width=4),
+                marker=dict(size=8)
+            )
         )
-    )
 
-    fig_ser.add_trace(
-        go.Scatter(
-            x=ebno_range,
-            y=ser_no_eq,
-            mode="lines+markers",
-            name="SER uncoded without MIMO equalization",
-            line=dict(width=3, dash="dot"),
-            marker=dict(size=9, symbol="circle")
+        fig_ser.add_trace(
+            go.Scatter(
+                x=ebno_range,
+                y=data[mode]["uncoded_ser"],
+                mode="lines+markers",
+                name=f"SER Uncoded + {prefix}",
+                line=dict(width=3, dash="dash"),
+                marker=dict(size=8)
+            )
         )
-    )
 
     fig_ser.update_layout(
-        title="SER vs Eb/N0 - Effect of LMMSE Equalization, 64-QAM",
+        title="SER vs Eb/N0",
         xaxis_title="Eb/N0 (dB)",
         yaxis_title="Symbol Error Rate (SER)",
         yaxis_type="log",
         template="plotly_white",
         hovermode="x unified",
-        height=600
+        height=650
     )
 
+    result_df = pd.DataFrame(rows)
+
     tab1, tab2, tab3, tab4 = st.tabs(
-        ["📉 BER", "📊 SER Reference", "📋 Bảng số liệu", "📝 Mô tả báo cáo"]
+        ["BER", "SER", "Bảng số liệu", "Tính toán hệ thống"]
     )
 
     with tab1:
@@ -345,69 +442,86 @@ if run_btn:
     with tab2:
         st.plotly_chart(fig_ser, use_container_width=True)
 
-        st.info(
-            "SER graph hiển thị 3 đường: SER before LDPC decoder, "
-            "SER uncoded + LMMSE và SER uncoded without MIMO equalization. "
-            "Đường without equalization có thể gần như nằm ngang ở mức lỗi cao, "
-            "vì trong MIMO spatial multiplexing nếu không có equalizer thì các luồng tín hiệu bị trộn qua ma trận kênh Rayleigh."
-        )
-
     with tab3:
-        result_df = pd.DataFrame(
-            {
-                "Eb/N0 (dB)": ebno_range,
-                "BER LDPC Coded + LMMSE": ber_coded,
-                "BER Uncoded + LMMSE": ber_uncoded,
-                "BER Uncoded without Equalization": ber_no_eq,
-                "SER Uncoded + LMMSE": ser_uncoded,
-                "SER Uncoded without Equalization": ser_no_eq,
-                "SER before LDPC Decoder": ser_pre_ldpc_coded,
-            }
-        )
+        result_df = pd.DataFrame(rows)
+
+        # Tách cột số và cột chữ để tránh lỗi:
+        # ValueError: Unknown format code 'e' for object of type 'str'
+        format_dict = {}
+
+        for col in result_df.columns:
+            # Cột text/status thì tuyệt đối không format số
+            if (
+                col.endswith("Status")
+                or col in ["Equalizer", "Mode", "Metric"]
+                or result_df[col].dtype == "object"
+            ):
+                continue
+
+            # Cột Eb/N0
+            if col == "Eb/N0 (dB)":
+                format_dict[col] = "{:.1f}"
+
+            # Cột thời gian
+            elif col == "Time (s)":
+                format_dict[col] = "{:.2f}"
+
+            # Cột đếm lỗi / tổng bit
+            elif col.endswith("Errors") or col.endswith("Total"):
+                format_dict[col] = "{:.0f}"
+
+            # Cột BER/SER dạng số thực
+            elif col.startswith("BER") or col.startswith("SER"):
+                format_dict[col] = "{:.3e}"
 
         st.dataframe(
-            result_df.style.format(
-                {
-                    "BER LDPC Coded + LMMSE": "{:.3e}",
-                    "BER Uncoded + LMMSE": "{:.3e}",
-                    "BER Uncoded without Equalization": "{:.3e}",
-                    "SER Uncoded + LMMSE": "{:.3e}",
-                    "SER Uncoded without Equalization": "{:.3e}",
-                    "SER before LDPC Decoder": "{:.3e}",
-                }
-            ),
+            result_df.style.format(format_dict),
             use_container_width=True
         )
 
     with tab4:
-        st.markdown(
-            f"""
-            **Đề 5: Mô phỏng hệ thống 2x2 MIMO-OFDM sử dụng mã hóa LDPC trên kênh truyền Rayleigh nhiễu trắng, điều chế 64-QAM. Đánh giá chất lượng BER/SER.**
-
-            Chương trình mô phỏng hệ thống **2x2 MIMO-OFDM** trên kênh truyền **Rayleigh block fading** có cộng **nhiễu trắng AWGN**.
-            Dữ liệu nhị phân được mã hóa bằng **LDPC 5G** với code rate **{code_rate_str}**, sau đó được điều chế bằng **64-QAM**.
-            Các symbol điều chế được ánh xạ lên **Resource Grid OFDM** và truyền qua kênh Rayleigh MIMO 2x2.
-
-            Tại phía thu, hệ thống chính sử dụng bộ cân bằng **LMMSE Equalizer** với giả thiết biết hoàn hảo đáp ứng kênh, tức **perfect CSI**.
-            Nhiễu AWGN được thêm vào sau kênh fading, và noise variance được tính bằng hàm **ebnodb2no** của Sionna để phù hợp với Eb/N0, số bit trên symbol, code rate và cấu hình OFDM Resource Grid.
-
-            Hiệu năng hệ thống được đánh giá chủ yếu thông qua:
-            - **BER LDPC coded + LMMSE**: BER của nhánh có mã hóa LDPC, đo sau LDPC decoder.
-            - **BER uncoded + LMMSE reference**: BER của nhánh MIMO-OFDM không mã hóa LDPC nhưng vẫn có cân bằng LMMSE.
-            - **BER uncoded without MIMO equalization**: BER của nhánh không mã hóa và không dùng bộ cân bằng MIMO.
-            - **SER uncoded + LMMSE** và **SER uncoded without equalization**: dùng để minh họa vai trò của bộ cân bằng LMMSE.
-
-            Trong hệ thống **spatial multiplexing MIMO**, tín hiệu từ nhiều anten phát bị trộn qua ma trận kênh Rayleigh.
-            Nếu không có bộ cân bằng, bộ thu không thể tách chính xác các luồng dữ liệu, dẫn đến BER/SER cao.
-            Bộ cân bằng **LMMSE** sử dụng thông tin kênh và phương sai nhiễu để ước lượng tín hiệu phát, từ đó cải thiện hiệu năng thu.
-
-            Ngoài ra, chương trình vẫn tính **SER before LDPC Decoder** cho nhánh LDPC.
-            Chỉ số này được đo tại tầng demapper trước khi giải mã LDPC, nên không dùng làm chỉ số chính để kết luận khả năng sửa lỗi của mã LDPC.
-            Lợi ích chính của LDPC được thể hiện qua đường **BER LDPC coded + LMMSE** so với **BER uncoded + LMMSE reference**.
-
-            Mô hình MIMO trong chương trình là **spatial multiplexing**, không phải Alamouti/STBC.
-            """
+        system_df = pd.DataFrame(
+            {
+                "Tham số": [
+                    "MIMO Scheme",
+                    "Transmit Antennas",
+                    "Receive Antennas",
+                    "Modulation",
+                    "Bits per Symbol",
+                    "LDPC Code Rate",
+                    "LDPC k",
+                    "LDPC n",
+                    "Packet/Data Symbols",
+                    "Decoder Iterations",
+                    "Channel",
+                    "Equalizer",
+                    "Eb/N0 Range",
+                    "Monte Carlo Min Errors",
+                    "Monte Carlo Max Bits",
+                    "Batch Size",
+                ],
+                "Giá trị": [
+                    "Alamouti/STBC",
+                    "2",
+                    "2",
+                    "64-QAM",
+                    str(system.bits_per_symbol),
+                    code_rate_str,
+                    str(system.k),
+                    str(system.n),
+                    str(system.num_data_symbols),
+                    str(decoder_iter),
+                    "Rayleigh + AWGN",
+                    ", ".join([mode_label[m] for m in modes]),
+                    f"{ebno_min:.1f} → {ebno_max:.1f} dB, step {ebno_step:.1f} dB",
+                    str(min_errors),
+                    f"{float(max_bits):.0e}",
+                    str(batch_size),
+                ],
+            }
         )
 
+        st.dataframe(system_df, use_container_width=True)
+
 else:
-    st.info("Nhấn **CHẠY MÔ PHỎNG** ở sidebar để bắt đầu Monte Carlo.")
+    st.info("Nhấn nút Chạy mô phỏng ở sidebar để bắt đầu.")
