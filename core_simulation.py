@@ -78,8 +78,24 @@ class AlamoutiSystem:
         return errors, total
 
     def count_symbol_errors_from_bits(self, bits_tx, bits_rx):
-        bits_tx_sym = tf.reshape(bits_tx, [-1, self.bits_per_symbol])
-        bits_rx_sym = tf.reshape(bits_rx, [-1, self.bits_per_symbol])
+        """
+        Count symbol/block errors by grouping every bits_per_symbol bits.
+
+        For 64-QAM:
+            1 symbol = 6 bits
+
+        If the bit length is not divisible by 6, the remaining tail bits are ignored.
+        This is useful for LDPC information bits when k is not divisible by 6.
+        """
+
+        total_bits = tf.shape(bits_tx)[-1]
+        usable_bits = (total_bits // self.bits_per_symbol) * self.bits_per_symbol
+
+        bits_tx_cut = bits_tx[..., :usable_bits]
+        bits_rx_cut = bits_rx[..., :usable_bits]
+
+        bits_tx_sym = tf.reshape(bits_tx_cut, [-1, self.bits_per_symbol])
+        bits_rx_sym = tf.reshape(bits_rx_cut, [-1, self.bits_per_symbol])
 
         sym_err_bool = tf.reduce_any(
             tf.not_equal(bits_tx_sym, bits_rx_sym),
